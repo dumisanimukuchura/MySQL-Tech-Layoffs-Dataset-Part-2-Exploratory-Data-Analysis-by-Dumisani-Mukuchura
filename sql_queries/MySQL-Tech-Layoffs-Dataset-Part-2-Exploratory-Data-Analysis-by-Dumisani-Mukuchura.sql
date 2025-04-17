@@ -444,7 +444,309 @@ ORDER BY
     pct_of_global DESC
 LIMIT 20;
 
+-- Answer: Some Industries are dorminant in the Country United States: Infrastructure, Hardware, Sales, Support, Legal, HR, Product have above 90% concerntration in US.
+
 
 -- --------------------------------------------------------------------------------------------------------------------------------------------
+
+/*
+3. Advanced Analysis (Window Functions, CTEs, Subqueries)
+
+3.1. Cumulative Metrics
+3.1.1. What is the cumulative number of layoffs over time?
+3.1.2. How does each company’s layoff count compare to the industry average?
+
+3.2. Ranking & Percentiles
+3.2.1. Which companies are in the top 10% of layoffs within their industry?
+3.2.2. How do layoffs rank by country when normalized by company size?
+
+3.3. Anomaly Detection
+3.3.1. Are there companies that laid off employees despite high funding (funds_raised)?
+3.3.2. Identify companies with layoffs significantly above/below industry averages.
+
+3.4. Temporal Clustering
+3.4.1. Are there clusters of layoffs following specific dates (e.g., post-funding rounds)?
+3.4.2. How long after funding do layoffs typically occur?
+*/
+
+-- SECTION: 3.1. Cumulative Metrics
+-- 3.1.1. What is the cumulative number of layoffs over time?
+WITH Ordered_By_Quarter AS
+(
+SELECT YEAR(`date`) AS year_,
+	   QUARTER(`date`) AS quarter_, 
+       SUM(total_laid_off) as quarterly_total_laid_off
+FROM tech_layoffs_dup
+GROUP BY YEAR(`date`), QUARTER(`date`) 
+)
+SELECT year_,
+	   quarter_,
+       quarterly_total_laid_off,
+	   SUM(quarterly_total_laid_off) OVER(ORDER BY year_, quarter_) AS rolling_total_laid_off
+FROM Ordered_By_Quarter;
+
+-- 3.1.2. How does each company’s layoff count compare to the industry average?
+
+SELECT t.company, t.industry, t.total_laid_off,  ROUND(Industry_Average_CTE.industry_average, 2)
+FROM tech_layoffs_dup t 
+JOIN (
+	  SELECT industry, AVG(total_laid_off) AS industry_average
+	  FROM tech_layoffs_dup
+	  GROUP BY industry
+     ) AS Industry_Average_CTE
+	ON t.industry = Industry_Average_CTE.industry
+ORDER BY 4 DESC;
+
+-- SECTION: 3.2. Ranking & Percentiles
+-- 3.2.1. Which companies are in the top 10% of layoffs within their industry?
+
+-- Way 1:
+WITH Total_Laid_Off AS ( -- Calculating the Total Number of Companies in an Industry
+    SELECT 
+        company,
+        industry,
+        total_laid_off,
+        ROW_NUMBER() OVER (PARTITION BY industry ORDER BY total_laid_off DESC) AS ranking, -- Adds Rank from 1 going Upwards per Industry with Order From Highest Total Laid Off
+        COUNT(*) OVER (PARTITION BY industry) AS total_companies
+    FROM tech_layoffs_dup
+),
+Top_10_Percent AS ( -- Creating the Number of Companies in top 10 of an Industry utilizing Arithmetic on Total Companies Count  
+    SELECT 
+        company,
+        industry,
+        total_laid_off,
+        ranking,
+        total_companies,
+        -- Calculate the top 10% cutoff
+        CEILING(total_companies * 0.1) AS top_10_threshold -- Ceiling:  to round up fractional values.
+    FROM Total_Laid_Off
+)
+SELECT 
+    company,
+    industry,
+    total_laid_off,
+    ranking
+FROM Top_10_Percent
+WHERE ranking <= top_10_threshold  -- Filter out Companies within the Top 10 by Rank 
+ORDER BY industry, total_laid_off DESC;
+
+-- Way 2 utilizing NTILE: The NTILE(n) function divides the result set into n buckets, ranking rows in a percentile-like manner.
+WITH RankedCompanies AS (
+    SELECT 
+        company,
+        industry,
+        total_laid_off,
+        NTILE(10) OVER (PARTITION BY industry ORDER BY total_laid_off DESC) AS percentile_rank
+    FROM tech_layoffs_dup
+)
+SELECT 
+    company,
+    industry,
+    total_laid_off
+FROM RankedCompanies
+WHERE percentile_rank = 1
+ORDER BY industry, total_laid_off DESC;
+
+-- 3.2.2. How do layoffs rank by country when normalized by company size? 
+
+/*
+This Query will not Work considering we do not have the Total Company Size just the Total Laid Off and Percentage Laid Off
+*/
+
+-- Query to Calculate the Approximate Original Workforce
+WITH LayoffCalculations AS (
+    SELECT 
+        company,
+        total_laid_off,
+        percentage_laid_off,
+        total_laid_off / (percentage_laid_off / 100.0) AS workforce_at_time_of_layoff
+    FROM tech_layoffs_dup
+),
+CompanyWorkforceEstimates AS (
+    SELECT 
+        company,
+        MAX(workforce_at_time_of_layoff) AS estimated_original_workforce
+    FROM LayoffCalculations
+    GROUP BY company
+)
+SELECT 
+    company,
+    estimated_original_workforce
+FROM CompanyWorkforceEstimates
+ORDER BY estimated_original_workforce DESC;
+
+/*
+Still this can not work as there are more that 1 subsequent LayOffs from one company as time progressed
+Thus we will include a Query on how to do it but considering if we had the Company Size prior to LayOffs
+*/
+
+-- Query to Calculate the Approximate Current Workforce at the stage of Laying Off. This unearths some inconsistencies e.g other undeclared Employee Outage not Layoffs or Layoffs that were not reported.
+
+-- Alternative estimation approach considering multiple layoffs
+WITH company_timeline AS (
+    SELECT 
+        company,
+        date,
+        total_laid_off,
+        percentage_laid_off,
+        SUM(total_laid_off) OVER(PARTITION BY company ORDER BY date) AS cumulative_laid_off,
+        LAG(date) OVER(PARTITION BY company ORDER BY date) AS prev_layoff_date
+    FROM tech_layoffs_dup
+)
+SELECT 
+    company,
+    date,
+    total_laid_off,
+    percentage_laid_off,
+    cumulative_laid_off / (percentage_laid_off) AS estimated_current_workforce_at_that_stage
+FROM company_timeline
+WHERE percentage_laid_off > 0; 
+
+-- Query to have been used to Calculate the Normalized Layoffs
+WITH NormalizedLayoffs AS (
+    -- Calculate layoffs normalized by company size for each country
+    SELECT 
+        country,
+        SUM(total_laid_off) AS total_layoffs,
+        SUM(company_size) AS total_company_size, -- Aggregate company size by country
+        CAST(SUM(total_laid_off) AS FLOAT) / NULLIF(SUM(company_size), 0) AS normalized_layoffs -- Prevent division by 0
+    FROM tech_layoffs_dup
+    GROUP BY country
+),
+RankedCountries AS (
+    -- Rank countries based on normalized layoffs
+    SELECT 
+        country,
+        total_layoffs,
+        total_company_size,
+        normalized_layoffs,
+        RANK() OVER (ORDER BY normalized_layoffs DESC) AS rank_by_layoffs
+    FROM NormalizedLayoffs
+)
+-- Retrieve the final ranked results
+SELECT 
+    country,
+    total_layoffs,
+    total_company_size,
+    normalized_layoffs,
+    rank_by_layoffs
+FROM RankedCountries
+ORDER BY rank_by_layoffs;
+
+-- SECTION: 3.3. Anomaly Detection
+-- 3.3.1. Are there companies that laid off employees despite high funding (funds_raised)?
+
+SELECT company, funds_raised
+FROM tech_layoffs_dup
+WHERE funds_raised > (
+					 SELECT AVG(funds_raised)
+                     FROM tech_layoffs_dup
+)
+ORDER BY funds_raised DESC;
+
+-- 3.3.2. Identify companies with layoffs significantly above/below industry averages.
+
+WITH RankedCompanies AS 
+(
+SELECT *,
+       NTILE(10) OVER(ORDER BY total_laid_off DESC) AS percentile_rank
+FROM tech_layoffs_dup
+)
+SELECT 
+    company,
+    industry,
+    total_laid_off,
+    percentile_rank
+FROM RankedCompanies
+WHERE percentile_rank = 1 OR
+	  percentile_rank = 10
+ORDER BY percentile_rank DESC;
+
+-- SECTION: 3.4. Temporal Clustering
+-- 3.4.1. Are there clusters of layoffs following specific dates (e.g., post-funding rounds)?
+
+-- Confirm there are companies with multiple stages
+SELECT t1.company, t1.stage, t1.total_laid_off, t2.stage, t2.total_laid_off
+FROM tech_layoffs_dup t1
+JOIN tech_layoffs_dup t2
+	ON t1.company = t2.company 
+    AND t1.stage != t2.stage;
+    
+-- Query to find availability of clusters in certain specific dates (by funding rounds)
+WITH StageClusters AS (
+    -- Group layoffs by stage and calculate metrics
+    SELECT 
+        stage,
+        COUNT(*) AS layoffs_count,
+        AVG(total_laid_off) AS avg_laid_off, -- Average layoffs for each stage
+        AVG(percentage_laid_off) AS avg_percentage_laid_off -- Average percentage layoffs for each stage
+    FROM tech_layoffs_dup
+    GROUP BY stage
+),
+ClusteredLayoffsByStage AS (
+    -- Dynamically split stages into clusters using a subquery for the average
+    SELECT 
+        stage,
+        layoffs_count,
+        avg_laid_off,
+        avg_percentage_laid_off,
+        CASE 
+            WHEN avg_laid_off >= (SELECT AVG(total_laid_off) FROM tech_layoffs_dup) THEN 'High Layoff Cluster'
+            WHEN avg_laid_off BETWEEN ((SELECT AVG(total_laid_off) FROM tech_layoffs_dup) * 0.5) AND ((SELECT AVG(total_laid_off) FROM tech_layoffs_dup) - 1) THEN 'Moderate Layoff Cluster'
+            ELSE 'Low Layoff Cluster'
+        END AS cluster_category
+    FROM StageClusters
+)
+-- Display cluster results
+SELECT 
+    stage,
+    cluster_category,
+    layoffs_count,
+    ROUND(avg_laid_off, 2),
+    avg_percentage_laid_off
+FROM ClusteredLayoffsByStage
+ORDER BY cluster_category DESC, layoffs_count DESC;
+
+/* Answer: 
+Low Layoff Cluster: Unknown, Series B, Series C, Series D, Series A, Series F, Seed, Series H, Series G
+Medium Layoff Cluster: Acquired, Series E, Private Equity, Subsidiary, Series I, Series J
+High Layoff Cluster: PostIPO
+*/
+
+-- 3.4.2. How long after funding do layoffs typically occur?
+
+-- Response: This question is not Answerable with the current information we do not have dates where rounds of funding happened we just have a mention of date of layoff and the stage when that happened.
+
+/*
+4. Complex Trends & Predictive Insights
+4.1. Segmentation by Company Stage
+4.1.1. Do early-stage startups (stage = 'Seed') have different layoff patterns than late-stage companies?
+
+4.2. Impact of Industry
+4.2.1. Which industries saw the fastest month-over-month growth in layoffs?
+4.2.2. Are certain industries recovering (declining layoffs over time)?
+
+4.3. Correlation Analysis
+4.3.1. Is there a correlation between funds_raised and total_laid_off?
+4.3.2. How does percentage_laid_off correlate with us_status or country?
+
+4.4. Text Analysis
+4.4.1. Are there industries or locations frequently appearing with terms like "Acquired" or "Bankrupt" in stage?
+*/
+
+/*
+5. Bonus: Advanced SQL Techniques
+5.1. Pivoting Data
+5.1.1. Create a pivot table showing layoffs by industry (rows) and year (columns).
+
+5.2. Time-Series Gaps
+5.2.1. Identify periods with no reported layoffs (data completeness check).
+
+5.3. Hypothesis Testing
+5.3.1. Do companies in certain countries have statistically significant differences in layoff percentages?
+
+5.4. Forecasting Prep
+5.4.1. Calculate rolling averages for layoffs to model future trends.
+*/
 
 

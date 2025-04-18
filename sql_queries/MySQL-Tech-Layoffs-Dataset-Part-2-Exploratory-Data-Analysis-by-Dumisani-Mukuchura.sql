@@ -734,6 +734,398 @@ High Layoff Cluster: PostIPO
 4.4.1. Are there industries or locations frequently appearing with terms like "Acquired" or "Bankrupt" in stage?
 */
 
+
+-- SECTION 4. Complex Trends & Predictive Insights
+-- 4.1. Segmentation by Company Stage
+-- Qstn: 4.1.1. Do early-stage startups (stage = 'Seed') have different layoff patterns than late-stage companies?
+
+-- Understand which stages are included in this Dataset
+SELECT distinct(stage)
+FROM tech_layoffs_dup;
+
+-- Understand how data has been captured in terms of months
+SELECT YEAR(`date`), COUNT(DISTINCT(MONTH(`date`))) AS month_count
+FROM tech_layoffs_dup
+GROUP BY YEAR(`date`);
+
+-- We have full data for 2023, 2024 then 2025 has data for 3 months, thus for the analysis we can have a group by YEAR too.
+
+-- Compare Early Stages to Mid and Late in terms of Average Layoffs, Average Percentage Layoffs and also Cases of Layoffs for the year 2023 since in the Dataset we have full year data for that year in our Dataset
+WITH stage_groups AS (
+-- Group the Stages into Early, Mid and Late using CASE STATEMENTS
+    SELECT 
+        CASE
+            WHEN stage IN ('Seed', 'Series A', 'Series B') THEN 'Early' -- Early: Focuses on initial product development, market fit, and first scaling efforts.
+            WHEN stage IN ('Private Equity', 'Subsidiary', 'Post-IPO', 'Acquired') THEN 'Late'  -- Late: Focuses on preparing for exit (IPO, acquisition), global expansion, dominance, or becoming part of a larger company (subsidiary, acquisition)
+            ELSE 'Mid' -- Mid: Series C, Series D, Series E, Series F, Series G, Series H, Series I, Series J - Focuses on growing user/customer base, entering new markets, building out operations.
+        END AS stage_group,
+        total_laid_off,
+        percentage_laid_off,
+        date
+    FROM tech_layoffs_dup
+)
+SELECT YEAR(`date`) AS year_,
+       stage_group,
+       ROUND(AVG(total_laid_off)) AS avg_layoffs,
+       AVG(percentage_laid_off) AS avg_percentage,
+       COUNT(*) AS cases,
+    -- Trend analysis Quarter to Quarter
+       SUM(CASE WHEN QUARTER(`date`) = 1 THEN total_laid_off ELSE 0 END) AS q1_layoffs,
+       SUM(CASE WHEN QUARTER(`date`) = 2 THEN total_laid_off ELSE 0 END) AS q2_layoffs,
+       SUM(CASE WHEN QUARTER(`date`) = 3 THEN total_laid_off ELSE 0 END) AS q3_layoffs,
+       SUM(CASE WHEN QUARTER(`date`) = 4 THEN total_laid_off ELSE 0 END) AS q4_layoffs
+FROM stage_groups
+GROUP BY year_, stage_group
+ORDER BY year_ ASC, avg_percentage DESC;
+
+/* Answer: 
+In 2023 Early stage Companies had the highest Average Layoff Percentage, the 2nd Highest Total Number of Layoffs, the Least amount of Layoff Cases, Quarter 2 had the Highest Total Number of Layoffs,
+In 2024 Early stage Companies had the highest Average Layoff Percentage, the Lowest Total Number of Layoffs, the Least amount of Layoff Cases, Quarter 2 had the Highest Total Number of Layoffs.
+In 2025 we have data for Q1 Only remember: Early stage Companies had the highest Average Layoff Percentage, the Lowest Total Number of Layoffs, the Least amount of Layoff Cases.
+*/
+
+-- 4.2. Impact of Industry
+-- Qstn: 4.2.1. Which industries saw the fastest month-over-month growth in layoffs?
+
+WITH monthly_trends AS (
+    SELECT 
+        industry,
+        YEAR(`date`) AS year_,
+        MONTH(`date`) AS month_,
+        SUM(total_laid_off) AS monthly_layoffs,
+        LAG(SUM(total_laid_off), 1) OVER (PARTITION BY industry ORDER BY YEAR(`date`), MONTH(`date`)) AS prev_month -- Lag by 1 Month and Group by Industry over Year and Month
+    FROM tech_layoffs_dup
+    GROUP BY industry, YEAR(`date`), MONTH(`date`)
+)
+SELECT 
+    industry,
+    ROUND(AVG((monthly_layoffs - prev_month) / NULLIF(prev_month, 0)), 2) AS avg_growth_rate, -- Prevent Division by Zero
+    COUNT(*) AS months_with_growth
+FROM monthly_trends
+WHERE prev_month IS NOT NULL
+GROUP BY industry
+ORDER BY avg_growth_rate DESC
+LIMIT 10;
+
+/* Answer: 
+Average Groth Rate of Month on Month Total Number of People Laid Of Top 10 Starting with the Highest:
+Hardware - 15 months with growth
+Infrastructure - 11 months with growth
+Manufacturing - 6 months with growth
+Transportation - 22 months with growth
+Media - 17 months with growth
+Other - 24 months with growth
+Sales - 12 months with growth
+Consumer - 21 months with growth
+HR - 14 months with growth
+Marketing - 18 months with growth
+*/
+
+-- Additional Twisted Qstn to Add more Learning Depth: 4.2.1. Which industries saw the fastest Quarter-over-Quarter Growth in Layoffs?
+
+WITH QuarterlyPercentages AS
+-- Step 1: Aggregate Layoffs by Quarter Grouped by Year and Industry
+(
+SELECT industry,
+	   YEAR(`date`) AS year_,
+	   QUARTER(`date`) AS quarter_,
+       AVG(percentage_laid_off) AS avg_quarterly_percentage
+FROM tech_layoffs_dup
+WHERE percentage_laid_off IS NOT NULL 
+GROUP BY year_, quarter_, industry
+),
+QoQGrowthAnalysis AS
+-- Step 2: Calculate Quarter on Quarter Growth for each Industry 
+(
+SELECT qp1.year_,
+       qp1.industry,
+       qp1.quarter_ AS current_quarter,
+       qp2.quarter_ AS previous_quarter,
+       CASE
+			WHEN qp2.avg_quarterly_percentage > 0 THEN
+            ((qp1.avg_quarterly_percentage - qp2.avg_quarterly_percentage) / qp2.avg_quarterly_percentage)
+            ELSE NULL
+	   END AS qoq_growth_percentage
+FROM QuarterlyPercentages AS qp1 
+JOIN QuarterlyPercentages AS qp2
+  ON qp1.industry = qp2.industry
+  AND (
+      -- Same year, sequential quarters
+      (qp1.year_ = qp2.year_ AND qp1.quarter_ = qp2.quarter_ + 1)
+      OR
+      -- Year transition (Q1 vs previous Q4)
+      (qp1.year_ = qp2.year_ + 1 AND qp1.quarter_ = 1 AND qp2.quarter_ = 4)
+  )
+),
+RankedIndustries AS 
+-- Step 3: Rank industries based on QoQ Growth Percentage
+(
+SELECT industry,
+       year_,
+       previous_quarter,
+	   current_quarter,
+       qoq_growth_percentage,
+       ROW_NUMBER() OVER (PARTITION BY year_ ORDER BY qoq_growth_percentage DESC) AS rn -- Useful to Limit results by Year to Get the Top 5 QoQ by Industry
+FROM QoQGrowthAnalysis
+WHERE qoq_growth_percentage IS NOT NULL -- Exclude cases without previous data
+-- ORDER BY year_ ASC,qoq_growth_percentage DESC
+)
+-- Display top industries with the fastest QoQ growth
+SELECT industry,
+       year_,
+       previous_quarter,
+	   current_quarter,
+       qoq_growth_percentage
+FROM RankedIndustries
+WHERE rn <= 5;
+
+/* Answer:
+Year: 2023: Top 5 Industries from Highest to Lowest: Sales(Q2 to Q3), Logistics(Q3 to Q4), HR(Q3 to Q4), Logistics(Q2 to Q3), Product(Q2 to Q3)
+Year: 2024: Top 5 Industries from Highest to Lowest: Real Eastate(Q3 to Q4), Finance(Q3 to Q4), Sales(Q1 to Q2), Consumer(Q3 to Q4), Security(Q1 to Q2)
+Year: 2025: Top 5 Industries from Highest to Lowest considering it has only Q1 Data: Security(Q4 to Q1), Food(Q4 to Q1), Transportation(Q4 to Q1), Other(Q4 to Q1), Support(Q4 to Q1)
+*/
+
+-- Qstn: 4.2.2. Are certain industries recovering (declining layoffs over time)?
+-- Way 1 of analyzing Declining Layoffs over Time: by Percentage Laid Off)
+WITH LayoffsAggregate AS
+(
+SELECT industry,
+       YEAR(`date`) AS year_,
+       QUARTER(`date`) AS quarter_,
+	   AVG(percentage_laid_off) AS avg_percentage_laid_off
+FROM tech_layoffs_dup
+GROUP BY year_, industry, quarter_
+),
+LayOffTrendAnalysis AS
+(
+SELECT t1.industry,
+       t1.year_,
+	   t1.quarter_ AS current_quarter,
+       t2.quarter_ AS previous_quarter,
+       t1.avg_percentage_laid_off AS current_avg_percentage,
+       t2.avg_percentage_laid_off AS previous_avg_percentage,
+       (t1.avg_percentage_laid_off - t2.avg_percentage_laid_off) AS layoff_delta_percentage
+FROM LayoffsAggregate t1
+JOIN LayoffsAggregate t2
+	ON t1.industry = t2.industry
+    AND (
+      -- Same year, sequential quarters
+      (t1.year_ = t2.year_ AND t1.quarter_ = t2.quarter_ + 1)
+      OR
+      -- Year transition (Q1 vs previous Q4)
+      (t1.year_ = t2.year_ + 1 AND t1.quarter_ = 1 AND t2.quarter_ = 4)
+  )
+),
+RecoveringIndustries AS
+(
+SELECT industry,
+	   AVG(layoff_delta_percentage) AS layoff_avg_delta, -- Average Change per Period
+       COUNT(
+             CASE 
+				WHEN layoff_delta_percentage < 0 THEN 1
+			 END
+			)  AS declining_periods,
+	   COUNT(*) AS total_periods
+FROM LayOffTrendAnalysis
+GROUP BY industry
+HAVING AVG(layoff_delta_percentage) < 0 -- Ensure overall negative trend (decline)
+	-- AND  declining_periods = total_periods  -- All periods show decline
+)
+-- Step 4: Display Recovering Industries 
+SELECT industry,
+	   layoff_avg_delta AS avg_decline_percentage,
+       declining_periods
+FROM RecoveringIndustries
+ORDER BY declining_periods DESC, avg_decline_percentage ASC; -- Sort by Most Recovery Periods Descending and Steepest decline() or 
+
+/* Answer: 
+For a decline for all time periods we have 0 industries.
+When we remove the filter that industry must be declining through all periods and sort by Descending Number of Periods it had Recovery 
+We end up with the highest number of periods with a decline is 4 and the industry with highest Recovery in order from Highest  
+Hardware
+Sales
+Consumer
+Finance
+Education
+Travel
+Marketing
+Retail
+Energy
+Crypto
+Aerospace
+AI
+
+This would make sense considering the Post COVID-19 Era though for context a Subject Matter Expert is needed
+*/
+
+-- Way 2 of implementing a Decline Analysis: Total Number of Layoffs.
+-- 4.2.2. Industry recovery analysis using Total Number of Layoffs and not Percentages
+WITH industry_quarters AS (
+    SELECT 
+        industry,
+        QUARTER(`date`) AS qtr,
+        SUM(total_laid_off) AS qtr_layoffs,
+        LAG(SUM(total_laid_off), 1) OVER (PARTITION BY industry ORDER BY QUARTER(`date`)) AS prev_qtr
+    FROM tech_layoffs_dup
+    GROUP BY industry, QUARTER(date)
+)
+SELECT 
+    industry,
+    SUM(CASE WHEN qtr_layoffs < prev_qtr THEN 1 ELSE 0 END) AS qtrs_declining,
+    COUNT(*) AS total_qtrs,
+    SUM(qtr_layoffs) AS total_layoffs
+FROM industry_quarters
+WHERE prev_qtr IS NOT NULL
+GROUP BY industry
+HAVING qtrs_declining >= 2  -- At least 2 quarters of decline
+ORDER BY qtrs_declining DESC;
+
+-- 4.3. Correlation Analysis
+-- 4.3.1. Is there a correlation between funds_raised and total_laid_off?
+-- Calculating the Pearson's Coefficient between funds_raised and total_laid_off 
+    
+SELECT 
+    (COUNT(*) * SUM(funds_raised * total_laid_off) - SUM(funds_raised) * SUM(total_laid_off)) /  -- Numerator:  n(Σxy)−(Σx)(Σy)
+    (
+        SQRT(
+            COUNT(*) * SUM(funds_raised * funds_raised) - SUM(funds_raised) * SUM(funds_raised)
+        ) *
+        SQRT(
+            COUNT(*) * SUM(total_laid_off * total_laid_off) - SUM(total_laid_off) * SUM(total_laid_off) -- Denominator: SQRT([nΣx −(Σx)][nΣy −(Σy)])
+        )
+    ) AS correlation_coefficient
+FROM tech_layoffs_dup
+WHERE total_laid_off IS NOT NULL 
+    AND funds_raised IS NOT NULL;
+
+-- Answer: The Correlation Coefficient is 0.248 which is a positive correlation which is not strong.
+
+-- 4.3.2. How does percentage_laid_off correlate with us_status or country?
+-- For a categorical variable we can look into the average grouped results 
+-- starting with us_status
+
+SELECT us_status, AVG(percentage_laid_off)
+FROM tech_layoffs_dup
+WHERE percentage_laid_off IS NOT NULL
+GROUP BY us_status;
+
+-- Answer: U.S.	0.191037; Non-U.S.	0.242199 thus the magnitude of having a layoff is more in Non-US than in US.
+
+-- for country 
+-- check how many countries are there first
+SELECT COUNT(DISTINCT(country))
+FROM tech_layoffs_dup;
+
+-- We have 38 Countries thus we can group and view the Top 10 weighting
+SELECT country, AVG(percentage_laid_off)
+FROM tech_layoffs_dup
+WHERE percentage_laid_off IS NOT NULL
+GROUP BY country
+ORDER BY 2 DESC;
+
+-- Answer: Highest is Denmark then South Korea, then Nigeria have a more likelihood to Lay Off due to their High Average Percentage Layoff. 
+
+-- Alternative Way to check correlation 
+
+SELECT 
+    -- Grouping column must be in GROUP BY
+    us_status,
+    
+    -- Aggregated calculations
+    AVG(percentage_laid_off) AS avg_percentage,
+    
+    -- T-test calculation (modified for MySQL compatibility)
+    (
+        -- Difference in means
+        (SELECT AVG(percentage_laid_off) FROM tech_layoffs_dup WHERE us_status = 'U.S.' AND percentage_laid_off IS NOT NULL) -
+        (SELECT AVG(percentage_laid_off) FROM tech_layoffs_dup WHERE us_status = 'Non-U.S.' AND percentage_laid_off IS NOT NULL)
+    ) / 
+    SQRT(
+        -- U.S. variance component
+        (SELECT STDDEV_POP(percentage_laid_off)^2 / COUNT(*) 
+         FROM tech_layoffs_dup 
+         WHERE us_status = 'U.S.' AND percentage_laid_off IS NOT NULL) +
+        
+        -- Non-U.S. variance component
+        (SELECT STDDEV_POP(percentage_laid_off)^2 / COUNT(*) 
+         FROM tech_layoffs_dup 
+         WHERE us_status = 'Non-U.S.' AND percentage_laid_off IS NOT NULL)
+    ) AS t_value
+FROM tech_layoffs_dup
+WHERE percentage_laid_off IS NOT NULL
+GROUP BY us_status;  -- Critical GROUP BY clause
+
+/* Answer:
+Understanding the t-value (-0.497)
+The t-value measures how different the two group means (U.S. vs. Non-U.S.) are relative to their natural variability.
+
+-Key Interpretation:
+- Magnitude (0.497):
+- The difference between groups is about 0.5 standard errors.
+- This is a small-to-moderate effect size.
+
+-Negative Sign:
+- Indicates the first group (U.S. with 0.191) has a lower average than the second group (Non-U.S. with 0.242).
+
+-Statistical Significance:
+For a threshold of |t| > 2 (p < 0.05), your result (-0.497) suggests:
+- No statistically significant difference between U.S. and Non-U.S. layoff percentages.
+
+-What The Results Show:
+Group	   Avg % Laid Off	t-value	Interpretation
+U.S.	   19.1%	        -0.497	Lower than Non-U.S., but not significantly so
+Non-U.S.   24.2%	        (same t-value)	Higher than U.S., but difference could be random
+
+-Practical Meaning:
+Observed Difference:
+Non-U.S. companies average 5.1 percentage points higher layoffs (24.2% vs 19.1%).
+-Statistical Confidence:
+This difference isn't large enough to rule out random chance (p > 0.05).
+Need more data or tighter variance to confirm if real.
+
+- Effect Size Context:
+- A 5.1% difference may still be practically important for business decisions, even if not statistically significant.
+*/
+
+-- 4.4. Text Analysis
+-- 4.4.1. Are there industries or locations frequently appearing with terms like "Acquired" in stage?
+
+-- Confirm the presence
+SELECT COUNT(*), 
+       COUNT(DISTINCT industry),
+       COUNT(DISTINCT country)
+FROM tech_layoffs_dup
+WHERE stage = "Acquired";
+
+-- Displaying the industries with "Aquired" in the stage
+SELECT industry, COUNT(industry) AS industry_count
+FROM tech_layoffs_dup
+WHERE stage = "Acquired"
+GROUP BY industry
+ORDER BY industry_count DESC;
+
+-- Answer: Retail leads with 17, then Other with 13, Food, Consumer tied with 12 and so on.
+
+-- Displaying countries with "Aquired" in the stage
+SELECT country, COUNT(country) AS country_count
+FROM tech_layoffs_dup
+WHERE stage = "Acquired"
+GROUP BY country
+ORDER BY country_count DESC;
+
+-- Answer: US lead with 94, then India with 11, then tied at 4 are Germany, Canada, Spain and so on.
+
+-- Alternative Way of Calculating merging Group by Industry and Country
+SELECT 
+    industry,
+    country,
+    COUNT(*) AS acquisition_cases
+FROM tech_layoffs_dup
+WHERE stage LIKE '%Acquired%'
+GROUP BY industry, country
+ORDER BY acquisition_cases DESC;
+
+
 /*
 5. Bonus: Advanced SQL Techniques
 5.1. Pivoting Data
@@ -748,5 +1140,47 @@ High Layoff Cluster: PostIPO
 5.4. Forecasting Prep
 5.4.1. Calculate rolling averages for layoffs to model future trends.
 */
+
+
+
+WITH monthly_trends AS (
+    SELECT 
+        industry,
+        YEAR(date) AS year,
+        MONTH(date) AS month,
+        SUM(total_laid_off) AS monthly_layoffs,
+        LAG(SUM(total_laid_off), 1) OVER (PARTITION BY industry ORDER BY YEAR(date), MONTH(date)) AS prev_month
+    FROM tech_layoffs_dup
+    GROUP BY industry, YEAR(date), MONTH(date)
+)
+SELECT 
+    industry,
+    AVG((monthly_layoffs - prev_month) / NULLIF(prev_month, 0)) AS avg_growth_rate,
+    COUNT(*) AS months_with_growth
+FROM monthly_trends
+WHERE prev_month IS NOT NULL
+GROUP BY industry
+ORDER BY avg_growth_rate DESC
+LIMIT 10;
+
+WITH industry_quarters AS (
+    SELECT 
+        industry,
+        QUARTER(date) AS qtr,
+        SUM(total_laid_off) AS qtr_layoffs,
+        LAG(SUM(total_laid_off), 1) OVER (PARTITION BY industry ORDER BY QUARTER(date)) AS prev_qtr
+    FROM tech_layoffs_dup
+    GROUP BY industry, QUARTER(date)
+)
+SELECT 
+    industry,
+    SUM(CASE WHEN qtr_layoffs < prev_qtr THEN 1 ELSE 0 END) AS qtrs_declining,
+    COUNT(*) AS total_qtrs,
+    SUM(qtr_layoffs) AS total_layoffs
+FROM industry_quarters
+WHERE prev_qtr IS NOT NULL
+GROUP BY industry
+HAVING qtrs_declining >= 2  -- At least 2 quarters of decline
+ORDER BY qtrs_declining DESC;
 
 

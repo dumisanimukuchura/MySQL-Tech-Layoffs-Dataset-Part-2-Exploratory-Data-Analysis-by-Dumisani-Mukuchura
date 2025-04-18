@@ -717,6 +717,8 @@ High Layoff Cluster: PostIPO
 
 -- Response: This question is not Answerable with the current information we do not have dates where rounds of funding happened we just have a mention of date of layoff and the stage when that happened.
 
+-- ----------------------------------------------------------------------------------------------------------------------------------------------
+
 /*
 4. Complex Trends & Predictive Insights
 4.1. Segmentation by Company Stage
@@ -1125,6 +1127,7 @@ WHERE stage LIKE '%Acquired%'
 GROUP BY industry, country
 ORDER BY acquisition_cases DESC;
 
+-- ----------------------------------------------------------------------------------------------------------------------------------------------
 
 /*
 5. Bonus: Advanced SQL Techniques
@@ -1323,5 +1326,7 @@ SELECT
     ) AS layoff_rolling_avg
 FROM MonthlyLayoffs
 ORDER BY year_, month_;
+
+-- ----------------------------------------------------------------------------------------------------------------------------------------------
 
 

@@ -1141,46 +1141,187 @@ ORDER BY acquisition_cases DESC;
 5.4.1. Calculate rolling averages for layoffs to model future trends.
 */
 
+-- SECTION 5. Bonus: Advanced SQL Techniques
+-- 5.1. Pivoting Data
+-- 5.1.1. Create a pivot table showing layoffs by industry (rows) and year (columns).
 
-
-WITH monthly_trends AS (
-    SELECT 
-        industry,
-        YEAR(date) AS year,
-        MONTH(date) AS month,
-        SUM(total_laid_off) AS monthly_layoffs,
-        LAG(SUM(total_laid_off), 1) OVER (PARTITION BY industry ORDER BY YEAR(date), MONTH(date)) AS prev_month
-    FROM tech_layoffs_dup
-    GROUP BY industry, YEAR(date), MONTH(date)
-)
-SELECT 
-    industry,
-    AVG((monthly_layoffs - prev_month) / NULLIF(prev_month, 0)) AS avg_growth_rate,
-    COUNT(*) AS months_with_growth
-FROM monthly_trends
-WHERE prev_month IS NOT NULL
+SELECT industry,
+	   SUM(CASE WHEN YEAR(`date`) = 2023 THEN total_laid_off ELSE 0 END) AS `2023`,
+	   SUM(CASE WHEN YEAR(`date`) = 2024 THEN total_laid_off ELSE 0 END) AS `2024`,
+       SUM(CASE WHEN YEAR(`date`) = 2025 THEN total_laid_off ELSE 0 END) AS `2025`
+FROM tech_layoffs_dup
+WHERE industry IS NOT NULL 
+      -- The condition checks that the trimmed value is not an empty string (i.e., it has some content)
+	  AND TRIM(industry) <> '' -- The TRIM function removes any leading or trailing whitespace characters. 
 GROUP BY industry
-ORDER BY avg_growth_rate DESC
-LIMIT 10;
+ORDER BY industry;
 
-WITH industry_quarters AS (
-    SELECT 
-        industry,
-        QUARTER(date) AS qtr,
-        SUM(total_laid_off) AS qtr_layoffs,
-        LAG(SUM(total_laid_off), 1) OVER (PARTITION BY industry ORDER BY QUARTER(date)) AS prev_qtr
-    FROM tech_layoffs_dup
-    GROUP BY industry, QUARTER(date)
+-- Confirm correctness by one Industry and Year
+SELECT industry, SUM(total_laid_off)
+FROM tech_layoffs_dup
+WHERE industry = "Aerospace" AND YEAR(`date`) = 2023;
+
+-- 5.2. Time-Series Gaps
+-- 5.2.1. Identify periods with no reported layoffs (data completeness check).
+
+-- Find months with no reported layoffs
+SELECT YEAR(`date`) AS year_,
+       MONTH(`date`) AS month_,
+       SUM(total_laid_off) AS total_layoffs
+FROM tech_layoffs_dup
+GROUP BY year_, month_
+HAVING total_layoffs = 0;
+
+-- Answer: There are no months with 0 layoffs, All months have some layoffs
+
+-- Just to check which is the Minimum and Maximum Monthly Layoffs since it is not zero
+WITH MonthlyTotalLayoffs AS
+-- Step 1: Group Sum of Total Laid Off by Month and Year
+(
+SELECT YEAR(`date`) AS year_,
+       MONTH(`date`) AS month_,
+       SUM(total_laid_off) AS total_layoffs
+FROM tech_layoffs_dup
+GROUP BY year_, month_
 )
+-- Step 2: Display the Maximum and Minimum Monthly Total Laid Off
+SELECT MAX(total_layoffs), min(total_layoffs)  
+FROM MonthlyTotalLayoffs;
+
+-- Min: 2268; Max: 87374
+
+-- Way 2 which would also help us identify the Year and Month those Minimum and Maximums Happened
+WITH MonthlyTotalLayoffs AS
+-- Step 1: Group Sum of Total Laid Off by Month and Year
+(
+SELECT YEAR(`date`) AS year_,
+       MONTH(`date`) AS month_,
+       SUM(total_laid_off) AS total_layoffs
+FROM tech_layoffs_dup
+GROUP BY year_, month_
+)
+SELECT year_, month_, total_layoffs
+FROM MonthlyTotalLayoffs
+WHERE total_layoffs = (SELECT MAX(total_layoffs) FROM MonthlyTotalLayoffs) -- Subquery in WHERE to create a Comparison Value
+   OR total_layoffs = (SELECT MIN(total_layoffs) FROM MonthlyTotalLayoffs);
+   
+-- Answer: Min 2268 December 2024 and Max 87344 January 2023
+
+-- For Data Completeness we could also check if there are Months totaly missing from the Dataset i.e Month-Year Combinations
+
+/* Note:
+As of date when this Analysis was done the Dataset had Data upto March 2025,
+thus we expect to see from April to December be outlined as missing Months. 
+*/
+
 SELECT 
-    industry,
-    SUM(CASE WHEN qtr_layoffs < prev_qtr THEN 1 ELSE 0 END) AS qtrs_declining,
-    COUNT(*) AS total_qtrs,
-    SUM(qtr_layoffs) AS total_layoffs
-FROM industry_quarters
-WHERE prev_qtr IS NOT NULL
-GROUP BY industry
-HAVING qtrs_declining >= 2  -- At least 2 quarters of decline
-ORDER BY qtrs_declining DESC;
+    y.year_,
+    m.month_
+FROM (SELECT DISTINCT YEAR(`date`) AS year_ -- Check which years are in the Dataset and cross join them to the List of Months to create Year-Month pairs
+      FROM tech_layoffs_dup) AS y
+      -- Create a List of Expected Months in a Calendar
+CROSS JOIN (SELECT 1 AS month_ 
+            UNION ALL SELECT 2 
+            UNION ALL SELECT 3 
+            UNION ALL SELECT 4
+            UNION ALL SELECT 5 
+            UNION ALL SELECT 6 
+            UNION ALL SELECT 7 
+            UNION ALL SELECT 8
+            UNION ALL SELECT 9 
+            UNION ALL SELECT 10 
+            UNION ALL SELECT 11 
+            UNION ALL SELECT 12) AS m
+-- Left Join the existing table data for comparison 
+LEFT JOIN ( -- This is a subquery that creates a Table of Year, Month that is existing currently
+    SELECT YEAR(`date`) AS year_, 
+    MONTH(`date`) AS month_
+    FROM tech_layoffs_dup
+    GROUP BY year_, month_
+) AS existing
+ON y.year_ = existing.year_ AND m.month_ = existing.month_ -- JOIN on Year-Month to confirm the expected 1:1 relationship
+WHERE existing.month_ IS NULL;
+
+-- Answer: Missing are Months 4 to 12 of Year 2025
+
+-- Alternative Way to Find Missing Months using A recursive CTE is a temporary result set that references itself, allowing you to perform iterative operations in SQL
+WITH RECURSIVE date_range AS (
+  -- Base case: Start with the earliest month in the dataset
+  SELECT MIN(DATE_FORMAT(`date`, '%Y-%m-01')) AS month_start 
+  FROM tech_layoffs_dup
+  
+  UNION ALL
+  
+  -- Recursive case: Add one month until we reach the last month in the dataset
+  SELECT DATE_ADD(month_start, INTERVAL 1 MONTH) -- The DATE_ADD() function adds a specified time interval to a date.
+  FROM date_range
+  WHERE month_start < (SELECT MAX(DATE_FORMAT(`date`, '%Y-%m-01')) FROM tech_layoffs_dup) -- Terminating Criteria with SubQuery in WHERE Clause
+),
+-- Get all existing year-month combinations from the data
+existing_months AS (
+  SELECT 
+    DATE_FORMAT(`date`, '%Y-%m-01') AS existing_month_start,
+    YEAR(`date`) AS year_,
+    MONTH(`date`) AS month_
+  FROM tech_layoffs_dup
+  GROUP BY existing_month_start, year_, month_
+)
+-- Select all months in the range and identify missing ones
+SELECT 
+  DATE_FORMAT(dr.month_start, '%Y') AS year_,
+  DATE_FORMAT(dr.month_start, '%m') AS month_,
+  CASE WHEN em.existing_month_start IS NULL THEN 'Missing' ELSE 'Present' END AS status
+FROM date_range AS dr
+LEFT JOIN existing_months AS em 
+	ON dr.month_start = em.existing_month_start
+-- To find missing months (like THE original query), uncomment this line:
+-- WHERE em.existing_month_start IS NULL
+ORDER BY dr.month_start;
+
+-- There are no missing Months as compared to the Dataset Month Range but when compared to usual Year makeup then 2025 Month 4 to 12 are missing
+
+
+-- 5.3. Hypothesis Testing
+-- 5.3.1. Do companies in certain countries have statistically significant differences in layoff percentages?
+
+/* Note:
+This question is asking whether companies in certain countries have statistically significant differences in their layoff percentages, meaning:
+- Are the percentages of layoffs across companies distinct enough between countries to conclude that location plays a role?
+- It explores whether these differences are not due to chance, requiring statistical tests to verify.
+*/
+
+SELECT 
+    country,
+    AVG(percentage_laid_off) AS avg_layoff_percentage,
+    STDDEV(percentage_laid_off) AS stddev_layoff_percentage,
+    COUNT(*) AS company_count
+FROM tech_layoffs_dup
+GROUP BY country
+ORDER BY stddev_layoff_percentage DESC;
+
+-- From here to perform statistical analysis we can export data to another program
+
+-- 5.4. Forecasting Prep
+-- 5.4.1. Calculate rolling averages for layoffs to model future trends.
+WITH MonthlyLayoffs AS (
+    -- Step 1: Aggregate monthly layoffs
+    SELECT 
+        YEAR(`date`) AS year_,
+        MONTH(`date`) AS month_,
+        SUM(total_laid_off) AS total_monthly_layoffs
+    FROM tech_layoffs_dup
+    GROUP BY YEAR(`date`), MONTH(`date`)
+)
+-- Step 2: Calculate rolling averages NB: Remember when an alias in introduced it can not be used within another Aggregate Column that is where we can use CTEs
+SELECT 
+    year_,
+    month_,
+    total_monthly_layoffs,
+    AVG(total_monthly_layoffs) OVER (
+        ORDER BY year_, month_ ROWS BETWEEN 1 PRECEDING AND CURRENT ROW -- This is between 2 months if i need 3 i can adjust ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+
+    ) AS layoff_rolling_avg
+FROM MonthlyLayoffs
+ORDER BY year_, month_;
 
 
